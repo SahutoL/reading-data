@@ -2,7 +2,7 @@ services:
   - type: web
     name: hameln-reading-api
     env: python
-    region: oregon
+    region: Singapore
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
