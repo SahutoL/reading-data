@@ -581,10 +581,3 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("APIを終了します")
-```
-
-### 3. Renderでの追加設定
-
-もし上記でもエラーが発生する場合は、Renderの環境変数に以下を追加してください：
-```
-PYTHON_VERSION=3.11.0
