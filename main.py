@@ -6,7 +6,6 @@ from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
-from functools import lru_cache
 import cloudscraper
 import time
 import random
@@ -16,7 +15,7 @@ import hmac
 import base64
 import json
 import os
-from jose import JWTError, jwt
+import jwt  # PyJWTを使用
 import secrets
 import logging
 
@@ -43,7 +42,7 @@ app.add_middleware(
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "30"))
-API_KEY = os.getenv("API_KEY", None)  # APIキーによる追加認証（オプション）
+API_KEY = os.getenv("API_KEY", None)
 
 # セキュリティスキーム
 security = HTTPBearer()
@@ -96,6 +95,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         "jti": secrets.token_urlsafe(16)
     })
     
+    # PyJWTを使用してエンコード
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -104,6 +104,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
     token = credentials.credentials
     
     try:
+        # PyJWTを使用してデコード
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("sub")
         if user_id is None:
@@ -113,7 +114,13 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return payload
-    except JWTError:
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="トークンの有効期限が切れています",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="トークンの検証に失敗しました",
@@ -123,7 +130,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
 def encrypt_credentials(user_id: str, password: str) -> str:
     """ログイン情報を暗号化"""
     data = json.dumps({"user_id": user_id, "password": password})
-    # BASE64エンコード（本番環境では適切な暗号化ライブラリを使用）
+    # BASE64エンコード
     encoded = base64.b64encode(data.encode()).decode()
     # HMAC署名を追加
     signature = hmac.new(
@@ -183,18 +190,21 @@ def parse_daily_data(daily_table) -> Dict[int, Dict[str, int]]:
         if len(cells) < 4:
             continue
         try:
-            day = int(cells[0].text.strip()[-2:])
-            daily_data[day] = {
-                'daily_book_count': parse_count(cells[1].text),
-                'daily_chapter_count': parse_count(cells[2].text),
-                'daily_word_count': parse_count(cells[3].text)
-            }
+            day_text = cells[0].text.strip()
+            # 日付を抽出（最後の2文字を取得）
+            if len(day_text) >= 2:
+                day = int(day_text[-2:].replace("日", ""))
+                daily_data[day] = {
+                    'daily_book_count': parse_count(cells[1].text),
+                    'daily_chapter_count': parse_count(cells[2].text),
+                    'daily_word_count': parse_count(cells[3].text)
+                }
         except (ValueError, IndexError) as e:
             logger.warning(f"日次データのパースエラー: {e}")
             continue
     return daily_data
 
-# キャッシュ用のデコレータ（簡易実装）
+# キャッシュ用のデータ構造
 class SimpleCache:
     def __init__(self, ttl_seconds: int = 300):
         self.cache = {}
@@ -216,7 +226,7 @@ class SimpleCache:
         self.cache.clear()
 
 # キャッシュインスタンス
-data_cache = SimpleCache(ttl_seconds=300)  # 5分間のキャッシュ
+data_cache = SimpleCache(ttl_seconds=300)
 
 # ハーメルンクライアント
 class HamelnClient:
@@ -228,13 +238,18 @@ class HamelnClient:
     
     def login(self, user_id: str, password: str) -> bool:
         """ハーメルンにログイン"""
-        self.scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
+        try:
+            self.scraper = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': 'windows',
+                    'desktop': True
+                }
+            )
+        except Exception as e:
+            logger.error(f"CloudScraperの初期化エラー: {e}")
+            # フォールバック: 基本的なCloudScraperを使用
+            self.scraper = cloudscraper.create_scraper()
         
         headers = {
             "User-Agent": get_random_user_agent(),
@@ -259,7 +274,9 @@ class HamelnClient:
             response = self.scraper.post(login_url, headers=headers, data=login_data)
             response.raise_for_status()
             
+            # ログイン失敗の判定
             if "ログインに失敗しました" in response.text or "mode=login" in response.url:
+                logger.warning(f"ログイン失敗: user_id={user_id}")
                 return False
             
             self.cookies = self.scraper.cookies.get_dict()
@@ -304,13 +321,16 @@ class HamelnClient:
                     response = self.scraper.get(history_url, headers=headers)
                     response.raise_for_status()
                     
+                    # セッション切れの確認
                     if "mode=login" in response.url:
+                        logger.error("セッションが無効です")
                         raise ValueError("セッションが無効です")
                     
                     soup = BeautifulSoup(response.text, "html.parser")
                     table = soup.find('table', class_="table1")
                     
                     if not table:
+                        logger.info(f"{year}-{month:02d}のデータなし")
                         continue
                     
                     info = table.find_all("td")
@@ -337,6 +357,7 @@ class HamelnClient:
                         daily_data=daily_data
                     ))
                     
+                    logger.info(f"{year}-{month:02d}のデータ取得成功")
                     time.sleep(get_random_delay())
                     
                 except Exception as e:
@@ -360,6 +381,7 @@ async def root():
             "health": "/health",
             "token": "/api/v3/token",
             "reading_data": "/api/v3/reading-data",
+            "reading_data_basic": "/api/v3/reading-data/basic",
             "documentation": "/docs"
         },
         "deployment": "Render",
@@ -393,7 +415,7 @@ async def create_token(request: TokenRequest):
     if not client.login(request.credentials.user_id, request.credentials.password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="ハーメルンへのログインに失敗しました"
+            detail="ハーメルンへのログインに失敗しました。IDまたはパスワードを確認してください。"
         )
     
     # ログイン情報を暗号化
@@ -408,6 +430,8 @@ async def create_token(request: TokenRequest):
         data={"sub": request.credentials.user_id, "creds": encrypted_creds},
         expires_delta=access_token_expires
     )
+    
+    logger.info(f"トークン発行: user_id={request.credentials.user_id}")
     
     return TokenResponse(
         access_token=access_token,
@@ -433,6 +457,7 @@ async def get_reading_data(
     if use_cache:
         cached_data = data_cache.get(cache_key)
         if cached_data:
+            logger.info(f"キャッシュヒット: {cache_key}")
             return ReadingDataResponse(
                 data=cached_data["data"],
                 fetched_at=cached_data["fetched_at"],
@@ -469,6 +494,7 @@ async def get_reading_data(
         # キャッシュに保存
         if use_cache:
             data_cache.set(cache_key, response_data)
+            logger.info(f"キャッシュ保存: {cache_key}")
         
         return ReadingDataResponse(
             data=reading_data,
@@ -492,6 +518,8 @@ async def get_reading_data_basic(
     """
     Basic認証で直接読書データを取得（シンプルな使用方法）
     """
+    logger.info(f"Basic認証アクセス: user_id={credentials.username}")
+    
     # ハーメルンにログインしてデータを取得
     client = HamelnClient()
     if not client.login(credentials.username, credentials.password):
@@ -543,3 +571,20 @@ async def general_exception_handler(request, exc):
             "timestamp": datetime.utcnow().isoformat()
         }
     )
+
+# 起動時のログ
+@app.on_event("startup")
+async def startup_event():
+    logger.info("ハーメルン読書データAPI v3.0.0 起動")
+    logger.info(f"環境: SECRET_KEY設定={bool(SECRET_KEY)}, API_KEY設定={bool(API_KEY)}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("APIを終了します")
+```
+
+### 3. Renderでの追加設定
+
+もし上記でもエラーが発生する場合は、Renderの環境変数に以下を追加してください：
+```
+PYTHON_VERSION=3.11.0
