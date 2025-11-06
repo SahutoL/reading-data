@@ -275,6 +275,8 @@ class HamelnClient:
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, "html.parser")
+
+            print(soup)
             
             if "ログインに失敗しました" in response.text:
                 logger.warning(f"ログイン失敗（明示的エラー）: user_id={user_id}")
