@@ -291,10 +291,8 @@ class HamelnClient:
         
         try:
             response = self.scraper.post(login_url, headers=headers, data=login_data)
-            print(f"ログイン後のHTML: {response.text}")
             response.raise_for_status()
             
-            soup = BeautifulSoup(response.text, "html.parser")
 
             print(soup)
             
