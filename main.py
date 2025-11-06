@@ -15,7 +15,7 @@ import hmac
 import base64
 import json
 import os
-import jwt  # PyJWTを使用
+import jwt
 import secrets
 import logging
 
@@ -176,7 +176,7 @@ def get_random_user_agent() -> str:
 
 def get_random_delay() -> float:
     """ランダムな遅延を生成"""
-    return random.uniform(1.5, 3.0)
+    return random.uniform(1.0, 3.0)
 
 def parse_count(text: str) -> int:
     """テキストから数値を抽出"""
@@ -230,11 +230,11 @@ data_cache = SimpleCache(ttl_seconds=300)
 
 # ハーメルンクライアント
 class HamelnClient:
-    """ハーメルンとの通信を管理するクライアント"""
     
     def __init__(self):
         self.scraper = None
         self.cookies = None
+        self.user_id = None
     
     def login(self, user_id: str, password: str) -> bool:
         """ハーメルンにログイン"""
@@ -274,16 +274,66 @@ class HamelnClient:
             response = self.scraper.post(login_url, headers=headers, data=login_data)
             response.raise_for_status()
             
-            # ログイン失敗の判定
-            if "ログインに失敗しました" in response.text or "mode=login" in response.url:
-                logger.warning(f"ログイン失敗: user_id={user_id}")
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            if "ログインに失敗しました" in response.text:
+                logger.warning(f"ログイン失敗（明示的エラー）: user_id={user_id}")
                 return False
             
-            self.cookies = self.scraper.cookies.get_dict()
-            return bool(self.cookies)
+            login_status = soup.find("ul", class_="spotlight")
+            if login_status and "ログイン中" in login_status.get_text():
+                logger.info(f"ログイン成功（ログイン中表示確認）: user_id={user_id}")
+                self.cookies = self.scraper.cookies.get_dict()
+                self.user_id = user_id
+                return True
+            
+            user_links = soup.find_all("a", href=lambda x: x and "/user/" in x)
+            if user_links:
+                logger.info(f"ログイン成功（ユーザーリンク確認）: user_id={user_id}")
+                self.cookies = self.scraper.cookies.get_dict()
+                self.user_id = user_id
+                return True
+            
+            cookies = self.scraper.cookies.get_dict()
+            if cookies and any(key in cookies for key in ['SES2', 'sson', 'autologin']):
+                logger.info(f"ログイン成功（セッションクッキー確認）: user_id={user_id}")
+                self.cookies = cookies
+                self.user_id = user_id
+                return True
+            
+            login_form = soup.find("form", {"action": lambda x: x and "login" in str(x).lower()})
+            if not login_form:
+                if cookies:
+                    logger.info(f"ログイン成功（ログインフォームなし）: user_id={user_id}")
+                    self.cookies = cookies
+                    self.user_id = user_id
+                    return True
+            
+            logger.debug(f"ログイン後のHTML冒頭500文字: {response.text[:500]}")
+            logger.debug(f"取得したクッキー: {cookies}")
+            
+            logger.warning(f"ログイン失敗（確認できず）: user_id={user_id}")
+            return False
             
         except Exception as e:
             logger.error(f"ログインエラー: {e}")
+            return False
+    
+    def verify_session(self) -> bool:
+        if not self.scraper or not self.cookies:
+            return False
+        
+        try:
+            response = self.scraper.get("https://syosetu.org/")
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            login_status = soup.find("ul", class_="spotlight")
+            if login_status and "ログイン中" in login_status.get_text():
+                return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"セッション確認エラー: {e}")
             return False
     
     def fetch_reading_data(
@@ -291,7 +341,6 @@ class HamelnClient:
         year_from: Optional[int] = None, 
         year_to: Optional[int] = None
     ) -> List[ReadingData]:
-        """読書データを取得"""
         if not self.scraper or not self.cookies:
             raise ValueError("ログインが必要です")
         
@@ -307,26 +356,45 @@ class HamelnClient:
         current_year = datetime.now().year
         current_month = datetime.now().month
         
-        start_year = year_from if year_from else 2024
+        STATS_START_YEAR = 2024
+        STATS_START_MONTH = 2
+        
+        start_year = year_from if year_from else STATS_START_YEAR
         end_year = year_to if year_to else current_year
         
+        if start_year < STATS_START_YEAR:
+            logger.warning(f"開始年を{STATS_START_YEAR}年に修正しました")
+            start_year = STATS_START_YEAR
+        
         for year in range(start_year, end_year + 1):
-            for month in range(1, 13):
-                if year == current_year and month > current_month:
-                    break
-                
+            if year == STATS_START_YEAR:
+                start_month = STATS_START_MONTH
+            else:
+                start_month = 1
+            
+            if year == current_year:
+                end_month = current_month
+            else:
+                end_month = 12
+            
+            for month in range(start_month, end_month + 1):
                 history_url = f"https://syosetu.org/?mode=view_reading_history&type=&date={year}-{month:02d}"
                 
                 try:
                     response = self.scraper.get(history_url, headers=headers)
                     response.raise_for_status()
                     
-                    # セッション切れの確認
-                    if "mode=login" in response.url:
-                        logger.error("セッションが無効です")
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    
+                    login_form = soup.find("form", {"action": lambda x: x and "login" in str(x).lower()})
+                    if login_form:
+                        logger.error("セッションが無効です（ログインフォーム検出）")
                         raise ValueError("セッションが無効です")
                     
-                    soup = BeautifulSoup(response.text, "html.parser")
+                    if "ログインしてください" in response.text:
+                        logger.error("セッションが無効です（ログイン要求検出）")
+                        raise ValueError("セッションが無効です")
+                    
                     table = soup.find('table', class_="table1")
                     
                     if not table:
@@ -341,7 +409,6 @@ class HamelnClient:
                     chapter_count = parse_count(info[1].get_text())
                     word_count = parse_count(info[2].get_text())
                     
-                    # 日次データを取得
                     daily_data = {}
                     daily_tables = soup.find_all('table', class_='table1')
                     if len(daily_tables) >= 4:
@@ -364,6 +431,7 @@ class HamelnClient:
                     logger.warning(f"{year}-{month:02d}のデータ取得エラー: {e}")
                     continue
             
+            # 年ごとの遅延
             if year < end_year:
                 time.sleep(get_random_delay())
         
