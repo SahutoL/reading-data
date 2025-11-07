@@ -6,21 +6,17 @@ from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
-import cloudscraper
-import time
-import random
-import requests
-import hashlib
-import hmac
-import base64
-import json
-import os
-import jwt
-import secrets
-import logging
+import base64, cloudscraper, hashlib, hmac, json, jwt, logging, os, random, requests, secrets, time
 
 # ログ設定
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("/home/deploy/apps/hameln_api/debug.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -226,7 +222,7 @@ class SimpleCache:
         self.cache.clear()
 
 # キャッシュインスタンス
-data_cache = SimpleCache(ttl_seconds=300)
+data_cache = SimpleCache(ttl_seconds=3000)
 
 # ハーメルンクライアント
 class HamelnClient:
@@ -246,14 +242,14 @@ class HamelnClient:
                     'desktop': True,
                     'mobile': False
                 },
-                delay=10,
+                delay=1,
                 interpreter='nodejs'
             )
 
             self.scraper.headers.update({
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                 'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept-Encoding': 'gzip, deflate',
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
                 'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
@@ -292,9 +288,8 @@ class HamelnClient:
         try:
             response = self.scraper.post(login_url, headers=headers, data=login_data)
             response.raise_for_status()
-            
 
-            print(soup)
+            soup = BeautifulSoup(response.text, "html.parser")
             
             if "ログインに失敗しました" in response.text:
                 logger.warning(f"ログイン失敗（明示的エラー）: user_id={user_id}")
@@ -302,21 +297,21 @@ class HamelnClient:
             
             login_status = soup.find("ul", class_="spotlight")
             if login_status and "ログイン中" in login_status.get_text():
-                logger.info(f"ログイン成功（ログイン中表示確認）: user_id={user_id}")
+                #logger.info(f"ログイン成功（ログイン中表示確認）: user_id={user_id}")
                 self.cookies = self.scraper.cookies.get_dict()
                 self.user_id = user_id
                 return True
             
             user_links = soup.find_all("a", href=lambda x: x and "/user/" in x)
             if user_links:
-                logger.info(f"ログイン成功（ユーザーリンク確認）: user_id={user_id}")
+                #logger.info(f"ログイン成功（ユーザーリンク確認）: user_id={user_id}")
                 self.cookies = self.scraper.cookies.get_dict()
                 self.user_id = user_id
                 return True
             
             cookies = self.scraper.cookies.get_dict()
             if cookies and any(key in cookies for key in ['SES2', 'sson', 'autologin']):
-                logger.info(f"ログイン成功（セッションクッキー確認）: user_id={user_id}")
+                #logger.info(f"ログイン成功（セッションクッキー確認）: user_id={user_id}")
                 self.cookies = cookies
                 self.user_id = user_id
                 return True
@@ -324,7 +319,7 @@ class HamelnClient:
             login_form = soup.find("form", {"action": lambda x: x and "login" in str(x).lower()})
             if not login_form:
                 if cookies:
-                    logger.info(f"ログイン成功（ログインフォームなし）: user_id={user_id}")
+                    #logger.info(f"ログイン成功（ログインフォームなし）: user_id={user_id}")
                     self.cookies = cookies
                     self.user_id = user_id
                     return True
@@ -346,7 +341,7 @@ class HamelnClient:
         try:
             response = self.scraper.get("https://syosetu.org/")
             soup = BeautifulSoup(response.text, "html.parser")
-            
+
             login_status = soup.find("ul", class_="spotlight")
             if login_status and "ログイン中" in login_status.get_text():
                 return True
@@ -396,7 +391,7 @@ class HamelnClient:
                 end_month = current_month
             else:
                 end_month = 12
-            
+
             for month in range(start_month, end_month + 1):
                 history_url = f"https://syosetu.org/?mode=view_reading_history&type=&date={year}-{month:02d}"
                 
@@ -405,6 +400,7 @@ class HamelnClient:
                     response.raise_for_status()
                     
                     soup = BeautifulSoup(response.text, "html.parser")
+
                     
                     login_form = soup.find("form", {"action": lambda x: x and "login" in str(x).lower()})
                     if login_form:
